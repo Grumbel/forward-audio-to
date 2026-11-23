@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Temporarily redirect desktop audio to another machine over SSH.
+set -euo pipefail
+
+if (( $# != 1 )); then
+    echo "Usage: forward-audio-to SSH_HOST" >&2
+    exit 2
+fi
+host=$1
+
+for tool in pactl parec ssh mkfifo awk; do
+    command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
+done
+
+original=$(pactl get-default-sink)
+[[ -n "$original" ]] || { echo 'No default audio sink' >&2; exit 1; }
+
+# Check before changing the local audio configuration.
+ssh -T -- "$host" 'command -v pacat >/dev/null && pactl info >/dev/null' </dev/null || {
+    echo "Cannot access remote audio via SSH ($host)" >&2
+    exit 1
+}
+
+virtual="ssh_audio_$$"
+module=''
+record_pid=''
+ssh_pid=''
+tmpdir=$(mktemp -d)
+
+# Move currently playing streams attached to one sink to another.
+move_inputs() {
+    local src=$1 dst=$2 idx id
+    idx=$(pactl list short sinks | awk -v name="$src" '$2 == name { print $1; exit }')
+    [[ -n "$idx" ]] || return 1
+    while IFS= read -r id; do
+        pactl move-sink-input "$id" "$dst" || :
+    done < <(pactl list short sink-inputs | awk -v idx="$idx" '$2 == idx { print $1 }')
+}
+
+cleanup() {
+    trap - EXIT INT TERM
+    # Stop both local capture and the SSH session (closing remote pacat's stdin).
+    [[ -z "$record_pid" ]] || kill "$record_pid" 2>/dev/null || :
+    [[ -z "$ssh_pid" ]] || kill "$ssh_pid" 2>/dev/null || :
+    [[ -z "$record_pid" ]] || wait "$record_pid" 2>/dev/null || :
+    [[ -z "$ssh_pid" ]] || wait "$ssh_pid" 2>/dev/null || :
+
+    if [[ -n "$module" ]]; then
+        # Do not overwrite a user-selected new default device.
+        if [[ $(pactl get-default-sink 2>/dev/null || :) == "$virtual" ]]; then
+            pactl set-default-sink "$original" || :
+        fi
+        move_inputs "$virtual" "$original" || :
+        pactl unload-module "$module" || :
+    fi
+    rm -f -- "$tmpdir/pcm"
+    rmdir -- "$tmpdir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+module=$(pactl load-module module-null-sink \
+    "sink_name=$virtual" format=s16le rate=48000 channels=2)
+mkfifo "$tmpdir/pcm"
+
+parec --record --raw --device="$virtual.monitor" \
+    --format=s16le --rate=48000 --channels=2 >"$tmpdir/pcm" &
+record_pid=$!
+ssh -T -- "$host" \
+    'exec pacat --playback --raw --format=s16le --rate=48000 --channels=2' \
+    <"$tmpdir/pcm" &
+ssh_pid=$!
+
+pactl set-default-sink "$virtual"
+move_inputs "$original" "$virtual"
+echo "Audio -> $host (Ctrl-C to restore $original)" >&2
+wait -n "$record_pid" "$ssh_pid"
