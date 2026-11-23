@@ -1,5 +1,5 @@
 {
-  description = "Temporarily forward desktop audio to another PC over SSH";
+  description = "Forward or mirror desktop audio to another PC over SSH";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -30,5 +30,16 @@
           program = "${self.packages.${system}.default}/bin/forward-audio-to";
         };
       });
+
+      checks = eachSystem (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.runCommand "forward-audio-to-tests" {
+            nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
+          } ''
+            bash ${./tests/test.sh} ${./forward-audio-to}
+            touch "$out"
+          '';
+        });
     };
 }

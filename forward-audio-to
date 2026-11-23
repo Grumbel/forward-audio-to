@@ -1,21 +1,70 @@
 #!/usr/bin/env bash
-# Temporarily redirect desktop audio to another machine over SSH.
+# Stream desktop audio to another machine over SSH.
 set -euo pipefail
 
-if (( $# != 1 )); then
-    echo "Usage: forward-audio-to SSH_HOST" >&2
-    exit 2
-fi
-host=$1
+version=0.2.0
 
-for tool in pactl parec ssh mkfifo awk; do
+usage() {
+    cat <<'HELP'
+Usage: forward-audio-to [OPTIONS] SSH_HOST
+
+Stream desktop audio to SSH_HOST using its PulseAudio/PipeWire audio output.
+Press Ctrl-C to stop streaming and clean up.
+
+Options:
+  --keep-local, --mirror   Play locally as usual AND forward a copy remotely
+                          (default: redirect local audio to the remote host)
+  -h, --help              Show this help and exit
+  -V, --version           Show version and exit
+
+Examples:
+  forward-audio-to other_host
+  forward-audio-to --keep-local other_host
+  forward-audio-to other_host --mirror
+
+The receiving host must have pacat and pactl available over SSH.
+HELP
+}
+
+usage_error() {
+    printf 'forward-audio-to: %s\nTry "forward-audio-to --help".\n' "$1" >&2
+    exit 2
+}
+
+keep_local=false
+host=''
+while (( $# )); do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        -V|--version) printf 'forward-audio-to %s\n' "$version"; exit 0 ;;
+        --keep-local|--mirror) keep_local=true ;;
+        --)
+            shift
+            while (( $# )); do
+                [[ -z "$host" ]] || usage_error 'expected exactly one SSH_HOST'
+                host=$1
+                shift
+            done
+            break
+            ;;
+        -*) usage_error "unknown option: $1" ;;
+        *)
+            [[ -z "$host" ]] || usage_error 'expected exactly one SSH_HOST'
+            host=$1
+            ;;
+    esac
+    shift
+done
+[[ -n "$host" ]] || usage_error 'missing SSH_HOST'
+
+for tool in pactl parec ssh mkfifo mktemp awk; do
     command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
 
 original=$(pactl get-default-sink)
 [[ -n "$original" ]] || { echo 'No default audio sink' >&2; exit 1; }
 
-# Check before changing the local audio configuration.
+# Verify remote access before altering local audio routing.
 ssh -T -- "$host" 'command -v pacat >/dev/null && pactl info >/dev/null' </dev/null || {
     echo "Cannot access remote audio via SSH ($host)" >&2
     exit 1
@@ -27,7 +76,7 @@ record_pid=''
 ssh_pid=''
 tmpdir=$(mktemp -d)
 
-# Move currently playing streams attached to one sink to another.
+# Move streams currently attached to one sink to another.
 move_inputs() {
     local src=$1 dst=$2 idx id
     idx=$(pactl list short sinks | awk -v name="$src" '$2 == name { print $1; exit }')
@@ -39,14 +88,14 @@ move_inputs() {
 
 cleanup() {
     trap - EXIT INT TERM
-    # Stop both local capture and the SSH session (closing remote pacat's stdin).
+    # Closing the stream also ends remote pacat (EOF on stdin).
     [[ -z "$record_pid" ]] || kill "$record_pid" 2>/dev/null || :
     [[ -z "$ssh_pid" ]] || kill "$ssh_pid" 2>/dev/null || :
     [[ -z "$record_pid" ]] || wait "$record_pid" 2>/dev/null || :
     [[ -z "$ssh_pid" ]] || wait "$ssh_pid" 2>/dev/null || :
 
     if [[ -n "$module" ]]; then
-        # Do not overwrite a user-selected new default device.
+        # Do not overwrite a different default sink selected while running.
         if [[ $(pactl get-default-sink 2>/dev/null || :) == "$virtual" ]]; then
             pactl set-default-sink "$original" || :
         fi
@@ -60,11 +109,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-module=$(pactl load-module module-null-sink \
-    "sink_name=$virtual" format=s16le rate=48000 channels=2)
-mkfifo "$tmpdir/pcm"
+if "$keep_local"; then
+    # Record the monitor of the physical/default sink. No routing changes:
+    # the same sound continues to play on the sender and is copied remotely.
+    capture_sink=$original
+else
+    # Redirect output into a temporary virtual sink; capture its monitor.
+    module=$(pactl load-module module-null-sink \
+        "sink_name=$virtual" format=s16le rate=48000 channels=2)
+    capture_sink=$virtual
+fi
 
-parec --record --raw --device="$virtual.monitor" \
+mkfifo "$tmpdir/pcm"
+parec --record --raw --device="$capture_sink.monitor" \
     --format=s16le --rate=48000 --channels=2 >"$tmpdir/pcm" &
 record_pid=$!
 ssh -T -- "$host" \
@@ -72,7 +129,11 @@ ssh -T -- "$host" \
     <"$tmpdir/pcm" &
 ssh_pid=$!
 
-pactl set-default-sink "$virtual"
-move_inputs "$original" "$virtual"
-echo "Audio -> $host (Ctrl-C to restore $original)" >&2
+if ! "$keep_local"; then
+    pactl set-default-sink "$virtual"
+    move_inputs "$original" "$virtual"
+    echo "Audio redirected -> $host (Ctrl-C to restore $original)" >&2
+else
+    echo "Audio mirrored -> $host (local output unchanged; Ctrl-C to stop)" >&2
+fi
 wait -n "$record_pid" "$ssh_pid"
