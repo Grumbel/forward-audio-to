@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Play another machine's desktop audio over SSH.
+set -euo pipefail
+
+version=0.2.0
+
+usage() {
+    cat <<'HELP'
+Usage: forward-audio-from [OPTIONS] SSH_HOST
+
+Play desktop audio from SSH_HOST on the local PulseAudio/PipeWire output.
+Press Ctrl-C to stop streaming and restore remote audio routing.
+
+Options:
+  --keep-remote, --mirror  Also play through the remote host's speakers
+                           (default: redirect remote audio to this machine)
+  -h, --help               Show this help and exit
+  -V, --version            Show version and exit
+
+The remote host must have bash, pactl, and parec available over SSH.
+HELP
+}
+
+usage_error() {
+    printf 'forward-audio-from: %s\nTry "forward-audio-from --help".\n' "$1" >&2
+    exit 2
+}
+
+mirror=false
+host=''
+while (( $# )); do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        -V|--version) printf 'forward-audio-from %s\n' "$version"; exit 0 ;;
+        --keep-remote|--mirror) mirror=true ;;
+        --)
+            shift
+            if (( $# )); then
+                [[ -z "$host" && $# -eq 1 ]] || usage_error 'expected exactly one SSH_HOST'
+                host=$1
+            fi
+            break ;;
+        -*) usage_error "unknown option: $1" ;;
+        *)
+            [[ -z "$host" ]] || usage_error 'expected exactly one SSH_HOST'
+            host=$1 ;;
+    esac
+    shift
+done
+[[ -n "$host" ]] || usage_error 'missing SSH_HOST'
+
+for tool in pactl pacat ssh mkfifo mktemp; do
+    command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
+done
+pactl info >/dev/null
+
+remote_script=$(cat <<'REMOTE'
+set -euo pipefail
+mirror=$1
+for tool in pactl parec cat awk; do
+    command -v "$tool" >/dev/null || { echo "Remote host is missing: $tool" >&2; exit 1; }
+done
+original=$(pactl get-default-sink)
+[[ -n "$original" ]] || { echo 'No remote default audio sink' >&2; exit 1; }
+
+virtual="ssh_audio_$$"
+module=''
+record_pid=''
+connection_pid=''
+
+move_inputs() {
+    local src=$1 dst=$2 idx id
+    idx=$(pactl list short sinks | awk -v name="$src" '$2 == name { print $1 }')
+    [[ -n "$idx" ]] || return 1
+    while IFS= read -r id; do
+        pactl move-sink-input "$id" "$dst" >&2 || :
+    done < <(pactl list short sink-inputs | awk -v idx="$idx" '$2 == idx { print $1 }')
+}
+
+cleanup() {
+    trap - EXIT
+    trap '' INT TERM HUP
+    if [[ -n "$record_pid" ]]; then
+        kill "$record_pid" 2>/dev/null || :
+        wait "$record_pid" 2>/dev/null || :
+    fi
+    if [[ -n "$connection_pid" ]]; then
+        kill "$connection_pid" 2>/dev/null || :
+        wait "$connection_pid" 2>/dev/null || :
+    fi
+    if [[ -n "$module" ]]; then
+        if [[ $(pactl get-default-sink 2>/dev/null || :) == "$virtual" ]]; then
+            pactl set-default-sink "$original" >&2 || :
+        fi
+        move_inputs "$virtual" "$original" || :
+        pactl unload-module "$module" >&2 || :
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Detect SSH disconnect even when the remote monitor is silent.
+cat <&3 >/dev/null &
+connection_pid=$!
+
+capture_sink=$original
+if ! "$mirror"; then
+    module=$(pactl load-module module-null-sink \
+        "sink_name=$virtual" format=s16le rate=48000 channels=2)
+    capture_sink=$virtual
+    pactl set-default-sink "$virtual" >&2
+    move_inputs "$original" "$virtual"
+    echo 'Remote audio redirected (Ctrl-C to restore remote output)' >&2
+else
+    echo 'Remote audio mirrored (Ctrl-C to stop)' >&2
+fi
+
+parec --record --raw --device="$capture_sink.monitor" \
+    --format=s16le --rate=48000 --channels=2 &
+record_pid=$!
+wait -n "$record_pid" "$connection_pid"
+REMOTE
+)
+
+tmpdir=$(mktemp -d)
+ssh_pid=''
+play_pid=''
+cleanup() {
+    local status=$? ssh_status=0 attempt
+    trap - EXIT
+    trap '' INT TERM
+    # Closing the control pipe asks the remote script to restore its routing.
+    exec 3>&-
+    if [[ -n "$play_pid" ]]; then
+        kill "$play_pid" 2>/dev/null || :
+        wait "$play_pid" 2>/dev/null || :
+    fi
+    if [[ -n "$ssh_pid" ]]; then
+        # Bound shutdown if SSH is stuck connecting or the peer stops responding.
+        for ((attempt=0; attempt<50; attempt++)); do
+            kill -0 "$ssh_pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill "$ssh_pid" 2>/dev/null || :
+        wait "$ssh_pid" 2>/dev/null || ssh_status=$?
+    fi
+    rm -f -- "$tmpdir/control" "$tmpdir/pcm"
+    rmdir -- "$tmpdir"
+    if (( status == 0 )); then
+        status=$ssh_status
+    fi
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkfifo "$tmpdir/control" "$tmpdir/pcm"
+exec 3<>"$tmpdir/control"
+# The remote login shell parses this command before Bash sees the script.
+ssh -T -- "$host" "exec bash -c '${remote_script//\'/\'\\\'\'}' bash $mirror 3<&0" \
+    <"$tmpdir/control" 3>&- >"$tmpdir/pcm" &
+ssh_pid=$!
+pacat --playback --raw --format=s16le --rate=48000 --channels=2 \
+    3>&- <"$tmpdir/pcm" &
+play_pid=$!
+
+status=0
+wait -n "$ssh_pid" "$play_pid" || status=$?
+if (( status == 127 )); then
+    # Both processes can finish before Bash starts waiting for either one.
+    wait "$play_pid"
+else
+    exit "$status"
+fi

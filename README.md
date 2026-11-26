@@ -1,6 +1,6 @@
 # forward-audio-to
 
-Stream your desktop audio to another PC over SSH, using PulseAudio or
+Stream desktop audio between PCs over SSH, using PulseAudio or
 PipeWire-Pulse on both computers. No persistent sound-system configuration.
 
 ## Build, run, install
@@ -39,6 +39,23 @@ forward-audio-to --keep-local other_host
 `-h`/`--help` prints usage, and `-V`/`--version` prints the version. Options
 can appear before or after the host.
 
+## Play audio from a remote host
+
+```sh
+forward-audio-from other_host
+forward-audio-from --keep-remote other_host
+nix run .#forward-audio-from -- other_host
+```
+
+By default, `forward-audio-from` redirects the remote host's default output
+to this machine. Ctrl-C restores the remote output and moves its streams
+back. Use `--keep-remote` (or `--mirror`) to keep playing through the
+remote speakers as well.
+
+The remote SSH session needs `bash`, `pactl`, `parec`, `awk`, and `cat`,
+with access to the remote user's desktop audio session. The flake supplies
+`pacat` and the other tools needed on the local machine.
+
 ## Receiver setup
 
 The **receiving PC** must have `pacat` and `pactl` available to its SSH
@@ -56,4 +73,4 @@ output changes while mirroring, the existing sink continues to be mirrored;
 restart the command to follow the new default.
 
 If using Nix flakes from within a Git repository, stage new files before
-building (`git add flake.nix forward-audio-to`).
+building (`git add flake.nix forward-audio-to forward-audio-from`).

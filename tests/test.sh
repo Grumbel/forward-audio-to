@@ -7,16 +7,22 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/state"
 
-cat >"$tmp/bin/pactl" <<'MOCK'
-#!/usr/bin/env bash
+write_mock() {
+    printf '#!%s\n' "$BASH"
+    cat
+}
+
+write_mock >"$tmp/bin/pactl" <<'MOCK'
 set -euo pipefail
 printf 'pactl %s\n' "$*" >>"$MOCK_STATE/log"
 case "$*" in
+    info) : ;;
     get-default-sink) cat "$MOCK_STATE/default" ;;
     'list short sinks')
-        printf '0\tlocal\n'
         if [[ -e "$MOCK_STATE/virtual" ]]; then
-            printf '1\t%s\n' "$(cat "$MOCK_STATE/virtual")"
+            printf '0\tlocal\n1\t%s\n' "$(cat "$MOCK_STATE/virtual")"
+        else
+            printf '0\tlocal\n'
         fi ;;
     'list short sink-inputs')
         printf '9\t%s\n' "$(cat "$MOCK_STATE/stream")" ;;
@@ -33,21 +39,22 @@ case "$*" in
 esac
 MOCK
 
-cat >"$tmp/bin/parec" <<'MOCK'
-#!/usr/bin/env bash
+write_mock >"$tmp/bin/parec" <<'MOCK'
 set -euo pipefail
 printf 'parec %s\n' "$*" >>"$MOCK_STATE/log"
 printf a
 exec sleep 60
 MOCK
 
-cat >"$tmp/bin/ssh" <<'MOCK'
-#!/usr/bin/env bash
+write_mock >"$tmp/bin/ssh" <<'MOCK'
 set -euo pipefail
 case "${*: -1}" in
     'command -v pacat >/dev/null && pactl info >/dev/null')
         printf 'ssh preflight %s\n' "$3" >>"$MOCK_STATE/log"
         [[ ! -e "$MOCK_STATE/remote_failure" ]] ;;
+    'exec bash -c '*)
+        printf 'ssh capture %s\n' "$3" >>"$MOCK_STATE/log"
+        exec bash -c "${*: -1}" ;;
     *)
         printf 'ssh stream %s\n' "$3" >>"$MOCK_STATE/log"
         cat >/dev/null ;;
@@ -134,3 +141,49 @@ assert_lacks 'load-module'
 assert_lacks 'parec'
 
 printf 'All forward-audio-to tests passed.\n'
+
+if (( $# < 2 )); then exit 0; fi
+script=$(realpath "$2")
+write_mock >"$tmp/bin/pacat" <<'MOCK'
+exec cat >"$MOCK_STATE/playback"
+MOCK
+chmod +x "$tmp/bin/pacat"
+
+[[ $(bash "$script" --version) == 'forward-audio-from 0.2.0' ]] || fail 'version flag'
+bash "$script" --help | grep -Fq -- '--keep-remote' || fail 'help flag'
+if bash "$script" receiver extra >"$tmp/out" 2>&1; then fail 'accepted two hosts'; fi
+
+# Wait for a byte of actual playback before signalling the client.
+start_and_stop_from() {
+    reset_state
+    bash "$script" "$@" >"$tmp/out" 2>"$tmp/err" &
+    local pid=$! i rc=0
+    for ((i=0; i<100; i++)); do
+        [[ ! -s "$MOCK_STATE/playback" ]] || break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    kill -TERM "$pid" 2>/dev/null || :
+    wait "$pid" || rc=$?
+    if [[ $rc -ne 143 ]]; then cat "$tmp/err" >&2; fail "unexpected exit: $rc"; fi
+    [[ $(cat "$MOCK_STATE/playback") == a ]] || fail 'expected raw PCM at local pacat'
+    [[ $(cat "$MOCK_STATE/default") == local ]] || fail 'remote default sink not restored'
+    [[ $(cat "$MOCK_STATE/stream") == 0 ]] || fail 'remote stream not restored'
+    [[ ! -e "$MOCK_STATE/virtual" ]] || fail 'remote virtual sink not removed'
+}
+
+start_and_stop_from sender --mirror
+assert_has 'ssh capture sender'
+assert_has '--device=local.monitor'
+assert_lacks 'load-module'
+assert_lacks 'set-default-sink'
+assert_lacks 'move-sink-input'
+
+start_and_stop_from sender
+assert_has 'load-module module-null-sink'
+assert_has '--device=ssh_audio_'
+assert_has 'move-sink-input 9 ssh_audio_'
+assert_has 'move-sink-input 9 local'
+assert_has 'unload-module 23'
+
+printf 'All forward-audio-from tests passed.\n'

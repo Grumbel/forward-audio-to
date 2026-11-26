@@ -1,5 +1,5 @@
 {
-  description = "Forward or mirror desktop audio to another PC over SSH";
+  description = "Forward or mirror desktop audio between PCs over SSH";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -10,26 +10,31 @@
     in
     {
       packages = eachSystem (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
-        in {
-          default = pkgs.writeShellApplication {
-            name = "forward-audio-to";
-            runtimeInputs = with pkgs; [
-              coreutils  # mkfifo, mktemp, rm, rmdir
-              gawk       # awk
-              openssh    # ssh
-              pulseaudio # pactl and parec (also work with PipeWire)
-            ];
-            text = builtins.readFile ./forward-audio-to;
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          package = name: source: pkgs.writeShellApplication {
+            inherit name;
+            runtimeInputs = with pkgs; [ coreutils gawk openssh pulseaudio ];
+            text = builtins.readFile source;
+          };
+        in rec {
+          forward-audio-to = package "forward-audio-to" ./forward-audio-to;
+          forward-audio-from = package "forward-audio-from" ./forward-audio-from;
+          default = pkgs.symlinkJoin {
+            name = "forward-audio";
+            paths = [ forward-audio-to forward-audio-from ];
           };
         });
 
-      apps = eachSystem (system: {
-        default = {
+      apps = eachSystem (system:
+        let app = name: {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/forward-audio-to";
+          program = "${self.packages.${system}.${name}}/bin/${name}";
         };
-      });
+        in {
+          default = app "forward-audio-to";
+          forward-audio-from = app "forward-audio-from";
+        });
 
       checks = eachSystem (system:
         let pkgs = nixpkgs.legacyPackages.${system};
@@ -37,7 +42,7 @@
           default = pkgs.runCommand "forward-audio-to-tests" {
             nativeBuildInputs = with pkgs; [ bash coreutils gawk gnugrep ];
           } ''
-            bash ${./tests/test.sh} ${./forward-audio-to}
+            bash ${./tests/test.sh} ${./forward-audio-to} ${./forward-audio-from}
             touch "$out"
           '';
         });
