@@ -57,6 +57,7 @@ case "${*: -1}" in
         exec bash -c "${*: -1}" ;;
     *)
         printf 'ssh stream %s\n' "$3" >>"$MOCK_STATE/log"
+        printf '%s\n' "${*: -1}" >>"$MOCK_STATE/log"
         cat >/dev/null ;;
 esac
 MOCK
@@ -113,6 +114,8 @@ start_and_stop 'Audio mirrored' --keep-local receiver
 assert_has 'ssh preflight receiver'
 assert_has 'ssh stream receiver'
 assert_has '--device=local.monitor'
+assert_has 'channels=2 --latency-msec=20'
+assert_has 'exec pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60'
 assert_lacks 'load-module'
 assert_lacks 'set-default-sink'
 assert_lacks 'move-sink-input'
@@ -145,6 +148,7 @@ printf 'All forward-audio-to tests passed.\n'
 if (( $# < 2 )); then exit 0; fi
 script=$(realpath "$2")
 write_mock >"$tmp/bin/pacat" <<'MOCK'
+printf 'pacat %s\n' "$*" >>"$MOCK_STATE/log"
 exec cat >"$MOCK_STATE/playback"
 MOCK
 chmod +x "$tmp/bin/pacat"
@@ -175,6 +179,8 @@ start_and_stop_from() {
 start_and_stop_from sender --mirror
 assert_has 'ssh capture sender'
 assert_has '--device=local.monitor'
+assert_has 'channels=2 --latency-msec=20'
+assert_has 'pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60'
 assert_lacks 'load-module'
 assert_lacks 'set-default-sink'
 assert_lacks 'move-sink-input'

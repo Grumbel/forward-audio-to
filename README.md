@@ -72,5 +72,9 @@ SSH keys avoid repeated password prompts. The stream is stereo, 16-bit PCM at
 output changes while mirroring, the existing sink continues to be mirrored;
 restart the command to follow the new default.
 
+Both commands request 20 ms of capture latency and 60 ms of playback
+latency. Actual end-to-end delay depends on the audio devices, sound
+servers, and network conditions.
+
 If using Nix flakes from within a Git repository, stage new files before
 building (`git add flake.nix forward-audio-to forward-audio-from`).

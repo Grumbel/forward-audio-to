@@ -122,10 +122,10 @@ fi
 
 mkfifo "$tmpdir/pcm"
 parec --record --raw --device="$capture_sink.monitor" \
-    --format=s16le --rate=48000 --channels=2 >"$tmpdir/pcm" &
+    --format=s16le --rate=48000 --channels=2 --latency-msec=20 >"$tmpdir/pcm" &
 record_pid=$!
 ssh -T -- "$host" \
-    'exec pacat --playback --raw --format=s16le --rate=48000 --channels=2' \
+    'exec pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60' \
     <"$tmpdir/pcm" &
 ssh_pid=$!
 

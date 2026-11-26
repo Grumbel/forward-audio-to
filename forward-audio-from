@@ -118,7 +118,7 @@ else
 fi
 
 parec --record --raw --device="$capture_sink.monitor" \
-    --format=s16le --rate=48000 --channels=2 &
+    --format=s16le --rate=48000 --channels=2 --latency-msec=20 &
 record_pid=$!
 wait -n "$record_pid" "$connection_pid"
 REMOTE
@@ -163,7 +163,7 @@ exec 3<>"$tmpdir/control"
 ssh -T -- "$host" "exec bash -c '${remote_script//\'/\'\\\'\'}' bash $mirror 3<&0" \
     <"$tmpdir/control" 3>&- >"$tmpdir/pcm" &
 ssh_pid=$!
-pacat --playback --raw --format=s16le --rate=48000 --channels=2 \
+pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60 \
     3>&- <"$tmpdir/pcm" &
 play_pid=$!
 
